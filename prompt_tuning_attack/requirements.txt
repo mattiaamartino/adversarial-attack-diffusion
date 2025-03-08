@@ -1,0 +1,9 @@
+torch
+transformers
+datasets
+Pillow
+numpy
+matplotlib
+opencv-python
+scikit-image
+tqdm
