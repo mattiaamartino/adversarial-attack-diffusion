@@ -1,15 +1,21 @@
+import matplotlib.pyplot as plt
+from PIL import Image
+
+def open_image(image_path):
+    image = Image.open(image_path)
+    image = image.convert("RGB")  # Ensure image is in RGB
+
+    return image
+
 def display_image(image, title=None):
-    import matplotlib.pyplot as plt
-    
     plt.imshow(image)
     if title:
         plt.title(title)
     plt.axis('off')
     plt.show()
 
+
 def plot_results(original, generated, title='Results'):
-    import matplotlib.pyplot as plt
-    
     plt.figure(figsize=(10, 5))
     plt.subplot(1, 2, 1)
     plt.imshow(original)
