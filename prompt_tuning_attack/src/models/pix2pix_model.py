@@ -1,3 +1,5 @@
+import torch
+
 class Pix2PixModel:
     def __init__(self):
         self.model = None

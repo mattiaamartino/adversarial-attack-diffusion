@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
 import clip
+import PIL
 from diffusers import StableDiffusionInstructPix2PixPipeline
 from learnable_prompt import LearnablePrompt
-from prompt_tuning_attack.src.models.dinov2_model import Dinov2Model
-from PIL import Image
-from torchvision import transforms
+from transformers import AutoImageProcessor, AutoModel
 
 class AttackerNetwork(nn.Module):
     """
@@ -21,6 +20,7 @@ class AttackerNetwork(nn.Module):
                  clip_model=None,
                  pix2pix_model=None,
                  dinov2_model=None,
+                 dinov2_processor=None,
                  positive_template="Make the image: ", 
                  negative_template="bad quality, blurry, low resolution",
                  positive_ctx_len=10,
@@ -78,77 +78,104 @@ class AttackerNetwork(nn.Module):
         else:
             self.pix2pix = pix2pix_model
             
-        # Freeze pix2pix model weights
-        for param in self.pix2pix.parameters():
-            param.requires_grad = False
+        # Freeze pix2pix model weights - freeze each component separately
+        for component_name in ['unet', 'text_encoder', 'vae', 'scheduler', 'feature_extractor', 'tokenizer', 'safety_checker', 'image_encoder']:
+            if hasattr(self.pix2pix, component_name):
+                component = getattr(self.pix2pix, component_name)
+                if hasattr(component, 'parameters'):
+                    for param in component.parameters():
+                        param.requires_grad = False
             
         # Load or use provided DINOv2 model
         if dinov2_model is None:
-            self.dinov2 = Dinov2Model()
-            self.dinov2.load_model()
+            self.dinov2 = AutoModel.from_pretrained("facebook/dinov2-small")
+            self.dinov2_processor = AutoImageProcessor.from_pretrained("facebook/dinov2-small")
             self.dinov2.to(self.device)
             self.dinov2.eval()
             
-            # Freeze DINOv2 model weights
-            for param in self.dinov2.model.parameters():
-                param.requires_grad = False
         else:
             self.dinov2 = dinov2_model
-            
-        # Image preprocessing for DINOv2
-        self.preprocess = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                std=[0.229, 0.224, 0.225]),
-        ])
+            self.dinov2_processor = dinov2_processor
+            self.dinov2.eval()
+
+         # Freeze DINOv2 model weights
+        for param in self.dinov2.parameters():
+            param.requires_grad = False
+
     
     def forward(self, image, num_inference_steps=50, guidance_scale=7.5):
         """
         Process an image through the attack pipeline.
-        
-        Args:
-            image: PIL Image to process
-            num_inference_steps: Number of denoising steps for pix2pix
-            guidance_scale: Guidance scale for pix2pix
-            
-        Returns:
-            tuple: (modified_image_features, original_image_features, modified_image)
-                - modified_image_features: DINOv2 features of the modified image
-                - original_image_features: DINOv2 features of the original image
-                - modified_image: The modified PIL Image
         """
         # Get prompt embeddings
         positive_embeds = self.positive_prompt()
         negative_embeds = self.negative_prompt()
         
         # Generate modified image with pix2pix using learnable prompts
-        with torch.no_grad():
-            output = self.pix2pix(
-                prompt_embeds=positive_embeds,
-                negative_prompt_embeds=negative_embeds,
-                image=image,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-            )
+        output = self.pix2pix(
+            prompt_embeds=positive_embeds,
+            negative_prompt_embeds=negative_embeds,
+            image=image,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            output_type="pt",  # Return tensor instead of PIL image
+        )
         
-        # Get the generated image
-        modified_image = output.images[0]
+        # Get the generated image tensor
+        modified_image_tensor = output.images[0]  # This is now a tensor
         
         # Process original image through DINOv2
-        original_tensor = self.preprocess(image).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            original_features = self.dinov2.predict(original_tensor)
+        # Convert PIL image to tensor if necessary
+        if not isinstance(image, torch.Tensor):
+            original_inputs = self.dinov2_processor(images=image, return_tensors="pt")
+            original_pixel_values = original_inputs.pixel_values.to(self.device)
+        else:
+            original_pixel_values = image.unsqueeze(0) if image.dim() == 3 else image
+            
+        # Process original image
+        original_outputs = self.dinov2(pixel_values=original_pixel_values)
+        original_features = original_outputs.last_hidden_state[:, 0]  # Using CLS token
         
         # Process modified image through DINOv2
-        modified_tensor = self.preprocess(modified_image).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            modified_features = self.dinov2.predict(modified_tensor)
+        # modified_image_tensor is already a tensor, just need to ensure correct format
+        modified_pixel_values = modified_image_tensor.unsqueeze(0) if modified_image_tensor.dim() == 3 else modified_image_tensor
+        modified_outputs = self.dinov2(pixel_values=modified_pixel_values)
+        modified_features = modified_outputs.last_hidden_state[:, 0]  # Using CLS token
+        
+        # Convert modified image tensor to PIL for visualization if needed
+        modified_image_pil = self.tensor_to_pil(modified_image_tensor)
             
-        return modified_features, original_features, modified_image
+        return modified_features, original_features, modified_image_pil
     
+    def tensor_to_pil(self, tensor):
+        """Helper function to convert tensor to PIL image for visualization"""
+        if tensor.dim() == 4:
+            tensor = tensor.squeeze(0)
+        tensor = tensor.cpu().detach()
+        tensor = (tensor + 1) / 2  # Convert from [-1, 1] to [0, 1]
+        tensor = tensor.clamp(0, 1)
+        tensor = tensor.permute(1, 2, 0).numpy()
+        return PIL.Image.fromarray((tensor * 255).astype('uint8'))
+
     def get_trainable_parameters(self):
         """
         Returns the trainable parameters of the model (only the learnable prompts).
         """
         return list(self.positive_prompt.parameters()) + list(self.negative_prompt.parameters())
+
+    def print_parameter_count(self):
+        """
+        Prints the number of trainable parameters vs total parameters in the network.
+        """
+        total_params = 0
+        trainable_params = 0
+        
+        # Count parameters in all modules
+        for name, module in self.named_modules():
+            for param in module.parameters(recurse=False):
+                total_params += param.numel()
+                if param.requires_grad:
+                    trainable_params += param.numel()
+                    
+        print(f"Trainable parameters: {trainable_params:,} / {total_params:,} total parameters")
+        print(f"Percentage of trainable parameters: {100 * trainable_params / total_params:.2f}%")
