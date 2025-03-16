@@ -87,7 +87,7 @@ class LearnablePrompt(nn.Module):
             text_embeddings (torch.Tensor): Complete text embeddings
         """
         # Combine all embeddings: [SOS] + template + ctx + [EOS]
-        full_embeddings = self._build_full_embeddings()
+        full_embeddings = self._build_full_embeddings().to(self.clip_model.dtype)
         # Encode the prompt
         output = self._encode_prompt(full_embeddings)
         

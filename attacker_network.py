@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import clip
 import PIL
-from diffusers import StableDiffusionInstructPix2PixPipeline
+from InstructDiffusionWrapper import InstructDiffusion
 from learnable_prompt import LearnablePrompt
 from transformers import AutoImageProcessor, AutoModel
 
@@ -25,7 +25,9 @@ class AttackerNetwork(nn.Module):
                  negative_template="bad quality, blurry, low resolution",
                  positive_ctx_len=10,
                  negative_ctx_len=5,
-                 device=None):
+                 config_path="InstructDiffusion/configs/instruct_diffusion.yaml",
+                 ckpt_path="InstructDiffusion/ckpt/v1-5-pruned-emaonly-adaption-task-humanalign.ckpt",
+                 device="cuda"):
         """
         Initialize the AttackerNetwork.
         
@@ -70,21 +72,14 @@ class AttackerNetwork(nn.Module):
         
         # Load or use provided pix2pix model
         if pix2pix_model is None:
-            self.pix2pix = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-                "timbrooks/instruct-pix2pix",
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                safety_checker=None,
-            ).to(self.device)
+            self.pix2pix = InstructDiffusion(
+                config_path=config_path,
+                ckpt_path=ckpt_path,
+                device=self.device
+                )
         else:
             self.pix2pix = pix2pix_model
-            
-        # Freeze pix2pix model weights - freeze each component separately
-        for component_name in ['unet', 'text_encoder', 'vae', 'scheduler', 'feature_extractor', 'tokenizer', 'safety_checker', 'image_encoder']:
-            if hasattr(self.pix2pix, component_name):
-                component = getattr(self.pix2pix, component_name)
-                if hasattr(component, 'parameters'):
-                    for param in component.parameters():
-                        param.requires_grad = False
+        
             
         # Load or use provided DINOv2 model
         if dinov2_model is None:
@@ -103,7 +98,12 @@ class AttackerNetwork(nn.Module):
             param.requires_grad = False
 
     
-    def forward(self, image, num_inference_steps=50, guidance_scale=7.5):
+    def forward(self, 
+                image, 
+                num_inference_steps=50, 
+                cfg_text=7.5,
+                cfg_image=1.5
+                ):
         """
         Process an image through the attack pipeline.
         """
@@ -117,35 +117,36 @@ class AttackerNetwork(nn.Module):
             negative_prompt_embeds=negative_embeds,
             image=image,
             num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            output_type="pt",  # Return tensor instead of PIL image
+            cfg_text=cfg_text,
+            cfg_image=cfg_image,
+            # output_type="pt",  # Return tensor instead of PIL image
         )
-        
-        # Get the generated image tensor
-        modified_image_tensor = output.images[0]  # This is now a tensor
         
         # Process original image through DINOv2
         # Convert PIL image to tensor if necessary
+        '''
         if not isinstance(image, torch.Tensor):
             original_inputs = self.dinov2_processor(images=image, return_tensors="pt")
             original_pixel_values = original_inputs.pixel_values.to(self.device)
         else:
-            original_pixel_values = image.unsqueeze(0) if image.dim() == 3 else image
+            original_pixel_values = image.unsqueeze(0) if image.dim() == 3 else image'
             
+
         # Process original image
         original_outputs = self.dinov2(pixel_values=original_pixel_values)
         original_features = original_outputs.last_hidden_state[:, 0]  # Using CLS token
+        '''
         
         # Process modified image through DINOv2
         # modified_image_tensor is already a tensor, just need to ensure correct format
-        modified_pixel_values = modified_image_tensor.unsqueeze(0) if modified_image_tensor.dim() == 3 else modified_image_tensor
+        modified_pixel_values = output.unsqueeze(0) if output.dim() == 3 else output
         modified_outputs = self.dinov2(pixel_values=modified_pixel_values)
         modified_features = modified_outputs.last_hidden_state[:, 0]  # Using CLS token
         
         # Convert modified image tensor to PIL for visualization if needed
-        modified_image_pil = self.tensor_to_pil(modified_image_tensor)
+        modified_image_pil = self.tensor_to_pil(output)
             
-        return modified_features, original_features, modified_image_pil
+        return modified_features, modified_image_pil
     
     def tensor_to_pil(self, tensor):
         """Helper function to convert tensor to PIL image for visualization"""
